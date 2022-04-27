@@ -398,14 +398,71 @@
           </widget>
          </item>
          <item>
+          <widget class="QGroupBox" name="groupBox_3">
+           <property name="minimumSize">
+            <size>
+             <width>0</width>
+             <height>365</height>
+            </size>
+           </property>
+           <property name="title">
+            <string>Flight Path Control   </string>
+           </property>
+           <widget class="QWidget" name="verticalLayoutWidget">
+            <property name="geometry">
+             <rect>
+              <x>10</x>
+              <y>149</y>
+              <width>411</width>
+              <height>81</height>
+             </rect>
+            </property>
+            <layout class="QVBoxLayout" name="verticalLayout_5" stretch="0,0">
+             <item>
+              <layout class="QHBoxLayout" name="horizontalLayout_4">
+               <item>
+                <widget class="QPushButton" name="_load_flight_button">
+                 <property name="text">
+                  <string>Load Flight from CSV</string>
+                 </property>
+                </widget>
+               </item>
+              </layout>
+             </item>
+             <item>
+              <layout class="QHBoxLayout" name="horizontalLayout_5">
+               <item>
+                <widget class="QPushButton" name="_show_flight_button">
+                 <property name="text">
+                  <string>Show flight path</string>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QPushButton" name="_play_flight_button">
+                 <property name="text">
+                  <string>Play Flight Path</string>
+                 </property>
+                </widget>
+               </item>
+              </layout>
+             </item>
+            </layout>
+           </widget>
+          </widget>
+         </item>
+         <item>
           <spacer name="horizontalSpacer_2">
            <property name="orientation">
             <enum>Qt::Horizontal</enum>
            </property>
+           <property name="sizeType">
+            <enum>QSizePolicy::Minimum</enum>
+           </property>
            <property name="sizeHint" stdset="0">
             <size>
-             <width>40</width>
-             <height>20</height>
+             <width>426</width>
+             <height>362</height>
             </size>
            </property>
           </spacer>

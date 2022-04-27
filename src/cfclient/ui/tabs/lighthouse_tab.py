@@ -50,10 +50,11 @@ from cfclient.ui.dialogs.lighthouse_bs_geometry_dialog import LighthouseBsGeomet
 from cfclient.ui.dialogs.basestation_mode_dialog import LighthouseBsModeDialog
 from cfclient.ui.dialogs.lighthouse_system_type_dialog import LighthouseSystemTypeDialog
 
-from vispy import scene
+from vispy import scene, app
 import numpy as np
 import math
 import os
+import csv
 
 __author__ = 'Bitcraze AB'
 __all__ = ['LighthouseTab']
@@ -69,6 +70,23 @@ STYLE_BLUE_BACKGROUND = "background-color: lightblue;"
 STYLE_ORANGE_BACKGROUND = "background-color: orange;"
 STYLE_NO_BACKGROUND = "background-color: none;"
 
+class FlightPose():
+    def __init__(self, the_scene, color):
+        self._scene = the_scene
+        self._color = color
+        self._poses = [[0,0,0]]
+        self._line = scene.visuals.LinePlot(
+            self._poses,
+            parent=self._scene,
+            width=2,
+            color='yellow',
+            face_color=self._color,
+            marker_size=0.0
+        )
+    def add_pose(self, positions):
+        # print(self._poses)
+        self._line.set_data(data=positions)
+        # scene.visuals.LinePlot.set_data(data=self._poses)
 
 class MarkerPose():
     COL_X_AXIS = 'red'
@@ -143,6 +161,7 @@ class MarkerPose():
 
 class Plot3dLighthouse(scene.SceneCanvas):
     POSITION_BRUSH = np.array((0, 0, 1.0))
+    FLIGHT_BRUSH = np.array((0.5, 0.5, 0))
     BS_BRUSH_VISIBLE = np.array((0.2, 0.5, 0.2))
     BS_BRUSH_NOT_VISIBLE = np.array((0.8, 0.5, 0.5))
 
@@ -169,6 +188,7 @@ class Plot3dLighthouse(scene.SceneCanvas):
 
         self._cf = None
         self._base_stations = {}
+        self._flight_path = None
 
         self.freeze()
 
@@ -183,6 +203,14 @@ class Plot3dLighthouse(scene.SceneCanvas):
             parent=self._view.scene)
 
         self._addArrows(1, 0.02, 0.1, 0.1, self._view.scene)
+
+    def _addRandomLine(self, parent):
+        scene.visuals.LinePlot([
+            [0,0,0],
+            [1,1,1],
+            [2,5,4]],
+            width=1.0, color='yellow', parent=parent, marker_size=0.0
+        )
 
     def _addArrows(self, length, width, head_length, head_width, parent):
         # The Arrow visual in vispy does not seem to work very good,
@@ -229,6 +257,11 @@ class Plot3dLighthouse(scene.SceneCanvas):
             self._cf = MarkerPose(self._view.scene, self.POSITION_BRUSH)
         self._cf.set_pose(position, rot)
 
+    def update_flight_pos(self, positions):
+        if not self._flight_path:
+            self._flight_path = FlightPose(self._view.scene, self.FLIGHT_BRUSH)
+        self._flight_path.add_pose(positions)
+
     def update_base_station_geos(self, geos):
         for id, geo in geos.items():
             if (geo is not None) and (id not in self._base_stations):
@@ -267,7 +300,7 @@ class LighthouseTab(Tab, lighthouse_tab_class):
     UPDATE_PERIOD_LOG = 100
 
     # Frame rate (updates per second)
-    FPS = 2
+    FPS = 20
 
     STATUS_NOT_RECEIVING = 0
     STATUS_MISSING_DATA = 1
@@ -290,11 +323,12 @@ class LighthouseTab(Tab, lighthouse_tab_class):
     _geometry_read_signal = pyqtSignal(object)
     _calibration_read_signal = pyqtSignal(object)
 
+
     def __init__(self, tabWidget, helper, *args):
         super(LighthouseTab, self).__init__(*args)
         self.setupUi(self)
 
-        self.tabName = "Lighthouse Positioning"
+        self.tabName = "Lighthouse Positioning Updated"
         self.menuName = "Lighthouse Positioning Tab"
         self.tabWidget = tabWidget
 
@@ -357,6 +391,14 @@ class LighthouseTab(Tab, lighthouse_tab_class):
 
         self._load_sys_config_button.clicked.connect(self._load_sys_config_button_clicked)
         self._save_sys_config_button.clicked.connect(self._save_sys_config_button_clicked)
+
+        #flight path
+        self._flight_path_file_name = None
+        self._flight_path_positions = []
+        self._show_flight_path = False
+        self._load_flight_button.clicked.connect(self._load_flight_path_button_clicked)
+        self._show_flight_button.clicked.connect(self._show_flight_path_button_clicked)
+        self._play_flight_button.clicked.connect(self._play_flight_path_button_clicked)
 
         self._is_connected = False
         self._update_ui()
@@ -525,6 +567,7 @@ class LighthouseTab(Tab, lighthouse_tab_class):
         if self.is_visible() and self.is_lighthouse_deck_active:
             self._plot_3d.update_cf_pose(self._helper.pose_logger.position,
                                          self._rpy_to_rot(self._helper.pose_logger.rpy_rad))
+            self._plot_3d.update_flight_pos(self._flight_path_positions)
             self._plot_3d.update_base_station_geos(self._lh_geos)
             self._plot_3d.update_base_station_visibility(self._bs_data_to_estimator)
             self._update_position_label(self._helper.pose_logger.position)
@@ -667,6 +710,41 @@ class LighthouseTab(Tab, lighthouse_tab_class):
                     else:
                         label.setStyleSheet(STYLE_RED_BACKGROUND)
                         label.setToolTip('')
+    def _load_flight_path_button_clicked(self):
+        names = QFileDialog.getOpenFileName(self, 'Open file', self._helper.current_folder, "*.csv;;*.txt")
+
+        if names[0] == '':
+            return
+        
+        self._helper.current_folder = os.path.dirname(names[0])
+
+        if self._flight_path_file_name is None:
+            self._flight_path_file_name = names[0]
+
+    def _show_flight_path_button_clicked(self):
+        #load csv
+        print(self._flight_path_file_name)
+        if not self._show_flight_path:
+            if self._flight_path_file_name is not None:
+                print("Reading csv")
+                with open(self._flight_path_file_name, 'r', encoding='UTF8') as csvfile:
+                    reader = csv.reader(csvfile)
+                    for i, row in enumerate(reader):
+                        if i >= 1:
+                            self._flight_path_positions.append(list([float(x) for x in row]))
+                self._update_graphics()
+                self._show_flight_path = True
+        else:
+            self._flight_path_positions.clear()
+            self._update_graphics()
+            self._show_flight_path = False
+        
+
+        
+
+    def _play_flight_path_button_clicked(self):
+        #play flgith path
+        print("play")
 
     def _load_sys_config_button_clicked(self):
         names = QFileDialog.getOpenFileName(self, 'Open file', self._helper.current_folder, "*.yaml;;*.*")
