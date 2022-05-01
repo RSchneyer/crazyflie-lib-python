@@ -30,7 +30,9 @@
 Shows data for the Lighthouse Positioning system
 """
 
+import enum
 import logging
+from queue import Empty
 
 from PyQt5 import uic
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer
@@ -43,6 +45,7 @@ from cfclient.ui.tab import Tab
 
 from cflib.crazyflie.log import LogConfig
 from cflib.crazyflie.mem import LighthouseMemHelper
+from cflib.positioning.position_hl_commander import PositionHlCommander
 from cflib.localization import LighthouseConfigWriter
 from cflib.localization import LighthouseConfigFileManager
 
@@ -54,6 +57,7 @@ from vispy import scene, app
 import numpy as np
 import math
 import os
+import time
 import csv
 
 __author__ = 'Bitcraze AB'
@@ -396,9 +400,11 @@ class LighthouseTab(Tab, lighthouse_tab_class):
         self._flight_path_file_name = None
         self._flight_path_positions = []
         self._show_flight_path = False
+        self._hlCommander = None
         self._load_flight_button.clicked.connect(self._load_flight_path_button_clicked)
         self._show_flight_button.clicked.connect(self._show_flight_path_button_clicked)
         self._play_flight_button.clicked.connect(self._play_flight_path_button_clicked)
+        self._land_button.clicked.connect(self._land_button_clicked)
 
         self._is_connected = False
         self._update_ui()
@@ -432,6 +438,14 @@ class LighthouseTab(Tab, lighthouse_tab_class):
 
         self._basestation_geometry_dialog.reset()
         self._is_connected = True
+
+        self._hlCommander = PositionHlCommander(
+            self._helper.cf,
+            x=0.0, y=0.0, z=0.0,
+            default_velocity=0.3,
+            default_height=0.5,
+            controller=int(self._helper.cf.param.get_value('stabilizer.controller'))
+        )
 
         if self._helper.cf.param.get_value('deck.bcLighthouse4') == '1':
             self._lighthouse_deck_detected()
@@ -727,11 +741,25 @@ class LighthouseTab(Tab, lighthouse_tab_class):
         if not self._show_flight_path:
             if self._flight_path_file_name is not None:
                 print("Reading csv")
+                minX, minY, maxX, maxY = 10, -10, 10, -10
                 with open(self._flight_path_file_name, 'r', encoding='UTF8') as csvfile:
                     reader = csv.reader(csvfile)
                     for i, row in enumerate(reader):
                         if i >= 1:
                             self._flight_path_positions.append(list([float(x) for x in row]))
+                        if self._flight_path_positions[i][0] < minX:
+                            minX = self._flight_path_positions[i-1][0]
+                        if self._flight_path_positions[i][0] > maxX:
+                            maxX = self._flight_path_positions[i-1][0]
+                        if self._flight_path_positions[i][1] < minY:
+                            minY = self._flight_path_positions[i-1][1]
+                        if self._flight_path_positions[i][1] > maxY:
+                            maxY = self._flight_path_positions[i-1][1]
+                    xoffset = (minX + maxX)/2
+                    yoffset = (minY + maxY)/2
+                    for i in len(self._flight_path_positions):
+                        self._flight_path_positions[i][0] -= xoffset
+                        self._flight_path_positions[i][1] -= yoffset
                 self._update_graphics()
                 self._show_flight_path = True
         else:
@@ -739,12 +767,69 @@ class LighthouseTab(Tab, lighthouse_tab_class):
             self._update_graphics()
             self._show_flight_path = False
         
-
-        
+    def _land_button_clicked(self):
+        print("land")
+        self._hlCommander.land()
 
     def _play_flight_path_button_clicked(self):
-        #play flgith path
         print("play")
+        DEL = 0.02
+        if self._hlCommander is None:
+            return
+        
+        self._helper.cf.param.set_value('kalman.resetEstimation', '1')
+        time.sleep(1)
+        if self._flight_path_positions is not Empty:
+            self._hlCommander.go_to(
+                x=self._flight_path_positions[0][0],
+                y=self._flight_path_positions[0][1],
+                z=self._flight_path_positions[0][2]
+            )
+        distance = self.distance(
+                list(self._helper.pose_logger.position),
+                self._flight_path_positions[0][0],
+                self._flight_path_positions[0][1],
+                self._flight_path_positions[0][2]
+            )
+        while distance > 0.03:
+            #have not reached first point
+            self._plot_3d.update_cf_pose(self._helper.pose_logger.position,
+                                         self._rpy_to_rot(self._helper.pose_logger.rpy_rad))
+            distance = self.distance(
+                list(self._helper.pose_logger.position),
+                self._flight_path_positions[0][0],
+                self._flight_path_positions[0][1],
+                self._flight_path_positions[0][2]
+            )
+        #when replaying flight path, only send the drone a vertex if it is > some distance away
+        print("playing points")
+        for i, point in enumerate(self._flight_path_positions):
+            self._plot_3d.update_cf_pose(self._helper.pose_logger.position,
+                                         self._rpy_to_rot(self._helper.pose_logger.rpy_rad))
+            distance = self.distance(
+                list(self._helper.pose_logger.position),
+                point[0],
+                point[1],
+                point[2]
+            )
+            if distance > 0.3:
+                print("Sent vertex", point[0], point[1], point[2])
+                self._hlCommander.go_to(
+                x=point[0],
+                y=point[1],
+                z=point[2]
+                )
+        print("Done")
+        self._hlCommander.go_to(
+                x=0,
+                y=0,
+                z=0
+            )
+
+            
+    
+    def distance(self, pos, x, y, z):
+        return math.sqrt((pos[0]-x)**2+(pos[1]-y)**2+(pos[2]-z)**2)
 
     def _load_sys_config_button_clicked(self):
         names = QFileDialog.getOpenFileName(self, 'Open file', self._helper.current_folder, "*.yaml;;*.*")
