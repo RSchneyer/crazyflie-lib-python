@@ -30,10 +30,13 @@
 Shows data for the Lighthouse Positioning system
 """
 
+import enum
 import logging
+from queue import Empty
+from tokenize import Name
 
 from PyQt5 import uic
-from PyQt5.QtCore import Qt, pyqtSignal, QTimer
+from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QRunnable, QThreadPool, QObject, pyqtSlot
 from PyQt5.QtWidgets import QMessageBox
 from PyQt5.QtWidgets import QFileDialog
 from PyQt5.QtWidgets import QLabel
@@ -43,6 +46,7 @@ from cfclient.ui.tab import Tab
 
 from cflib.crazyflie.log import LogConfig
 from cflib.crazyflie.mem import LighthouseMemHelper
+from cflib.positioning.position_hl_commander import PositionHlCommander
 from cflib.localization import LighthouseConfigWriter
 from cflib.localization import LighthouseConfigFileManager
 
@@ -50,10 +54,13 @@ from cfclient.ui.dialogs.lighthouse_bs_geometry_dialog import LighthouseBsGeomet
 from cfclient.ui.dialogs.basestation_mode_dialog import LighthouseBsModeDialog
 from cfclient.ui.dialogs.lighthouse_system_type_dialog import LighthouseSystemTypeDialog
 
-from vispy import scene
+from vispy import scene, app
 import numpy as np
 import math
 import os
+import time
+import csv
+
 
 __author__ = 'Bitcraze AB'
 __all__ = ['LighthouseTab']
@@ -68,6 +75,26 @@ STYLE_GREEN_BACKGROUND = "background-color: lightgreen;"
 STYLE_BLUE_BACKGROUND = "background-color: lightblue;"
 STYLE_ORANGE_BACKGROUND = "background-color: orange;"
 STYLE_NO_BACKGROUND = "background-color: none;"
+
+class FlightPose():
+    def __init__(self, the_scene, color, positions):
+        self._scene = the_scene
+        self._color = color
+        self._poses = [[0,0,0]]
+        self._line = scene.visuals.LinePlot(
+            positions,
+            parent=self._scene,
+            width=2,
+            color=color,
+            face_color=self._color,
+            marker_size=0.0
+        )
+    def add_pose(self, positions):
+        # print(self._poses)
+        self._line.set_data(data=positions)
+        # scene.visuals.LinePlot.set_data(data=self._poses)
+    def clear_lines(self):
+        self._line.parent = None
 
 
 class MarkerPose():
@@ -143,6 +170,7 @@ class MarkerPose():
 
 class Plot3dLighthouse(scene.SceneCanvas):
     POSITION_BRUSH = np.array((0, 0, 1.0))
+    FLIGHT_BRUSH = np.array((0.5, 0.5, 0))
     BS_BRUSH_VISIBLE = np.array((0.2, 0.5, 0.2))
     BS_BRUSH_NOT_VISIBLE = np.array((0.8, 0.5, 0.5))
 
@@ -169,7 +197,7 @@ class Plot3dLighthouse(scene.SceneCanvas):
 
         self._cf = None
         self._base_stations = {}
-
+        self._flight_paths = []
         self.freeze()
 
         plane_size = 10
@@ -183,6 +211,14 @@ class Plot3dLighthouse(scene.SceneCanvas):
             parent=self._view.scene)
 
         self._addArrows(1, 0.02, 0.1, 0.1, self._view.scene)
+
+    def _addRandomLine(self, parent):
+        scene.visuals.LinePlot([
+            [0,0,0],
+            [1,1,1],
+            [2,5,4]],
+            width=1.0, color='yellow', parent=parent, marker_size=0.0
+        )
 
     def _addArrows(self, length, width, head_length, head_width, parent):
         # The Arrow visual in vispy does not seem to work very good,
@@ -229,6 +265,15 @@ class Plot3dLighthouse(scene.SceneCanvas):
             self._cf = MarkerPose(self._view.scene, self.POSITION_BRUSH)
         self._cf.set_pose(position, rot)
 
+    def update_flight_pos(self, positions):
+        self._flight_paths.append(FlightPose(self._view.scene, "yellow", positions))
+    
+    def clear_flight_pos(self):
+        for path in self._flight_paths:
+            path.clear_lines()
+        self._flight_paths.clear()
+        self.update_flight_pos(None)
+
     def update_base_station_geos(self, geos):
         for id, geo in geos.items():
             if (geo is not None) and (id not in self._base_stations):
@@ -267,7 +312,7 @@ class LighthouseTab(Tab, lighthouse_tab_class):
     UPDATE_PERIOD_LOG = 100
 
     # Frame rate (updates per second)
-    FPS = 2
+    FPS = 20
 
     STATUS_NOT_RECEIVING = 0
     STATUS_MISSING_DATA = 1
@@ -290,15 +335,18 @@ class LighthouseTab(Tab, lighthouse_tab_class):
     _geometry_read_signal = pyqtSignal(object)
     _calibration_read_signal = pyqtSignal(object)
 
+
     def __init__(self, tabWidget, helper, *args):
         super(LighthouseTab, self).__init__(*args)
         self.setupUi(self)
 
-        self.tabName = "Lighthouse Positioning"
+        self.tabName = "Lighthouse Positioning Updated"
         self.menuName = "Lighthouse Positioning Tab"
         self.tabWidget = tabWidget
 
         self._helper = helper
+
+        self.threadpool = QThreadPool()
 
         # Always wrap callbacks from Crazyflie API though QT Signal/Slots
         # to avoid manipulating the UI when rendering it
@@ -358,6 +406,16 @@ class LighthouseTab(Tab, lighthouse_tab_class):
         self._load_sys_config_button.clicked.connect(self._load_sys_config_button_clicked)
         self._save_sys_config_button.clicked.connect(self._save_sys_config_button_clicked)
 
+        #flight path
+        self._flight_path_file_names = []
+        self._flight_path_positions = {}
+        self._show_flight_path = False
+        self._hlCommander = None
+        self._load_flight_button.clicked.connect(self._load_flight_path_button_clicked)
+        self._flight_path_list.itemClicked.connect(self._flight_path_list_clicked)
+        self._play_flight_button.clicked.connect(self._play_flight_path_button_clicked)
+        self._land_button.clicked.connect(self._land_button_clicked)
+
         self._is_connected = False
         self._update_ui()
 
@@ -390,6 +448,14 @@ class LighthouseTab(Tab, lighthouse_tab_class):
 
         self._basestation_geometry_dialog.reset()
         self._is_connected = True
+
+        self._hlCommander = PositionHlCommander(
+            self._helper.cf,
+            x=0.0, y=0.0, z=0.0,
+            default_velocity=0.3,
+            default_height=0.5,
+            controller=int(self._helper.cf.param.get_value('stabilizer.controller'))
+        )
 
         if self._helper.cf.param.get_value('deck.bcLighthouse4') == '1':
             self._lighthouse_deck_detected()
@@ -525,6 +591,7 @@ class LighthouseTab(Tab, lighthouse_tab_class):
         if self.is_visible() and self.is_lighthouse_deck_active:
             self._plot_3d.update_cf_pose(self._helper.pose_logger.position,
                                          self._rpy_to_rot(self._helper.pose_logger.rpy_rad))
+            #self._plot_3d.update_flight_pos(self._flight_path_positions)
             self._plot_3d.update_base_station_geos(self._lh_geos)
             self._plot_3d.update_base_station_visibility(self._bs_data_to_estimator)
             self._update_position_label(self._helper.pose_logger.position)
@@ -536,6 +603,7 @@ class LighthouseTab(Tab, lighthouse_tab_class):
         self._change_system_type_button.setEnabled(enabled)
         self._load_sys_config_button.setEnabled(enabled)
         self._save_sys_config_button.setEnabled(enabled)
+        self._play_flight_button.setEnabled(enabled)
 
     def _update_position_label(self, position):
         if len(position) == 3:
@@ -668,6 +736,53 @@ class LighthouseTab(Tab, lighthouse_tab_class):
                         label.setStyleSheet(STYLE_RED_BACKGROUND)
                         label.setToolTip('')
 
+    def _load_flight_path_button_clicked(self):
+        names = QFileDialog.getOpenFileName(self, 'Open file', self._helper.current_folder, "*.csv;;*.txt")
+
+        if names[0] == '':
+            return
+
+        self._helper.current_folder = os.path.dirname(names[0])
+        self._flight_path_file_names.append(names[0])
+        self._flight_path_list.addItem(names[0])
+
+    def _flight_path_list_clicked(self):
+        self._flight_path_positions.clear()
+        self._plot_3d.clear_flight_pos()
+        for items in self._flight_path_list.selectedItems():
+            print(items.text())
+            self._flight_path_positions[items.text()] = []
+            self.show_flight_path(items.text())
+    
+    def show_flight_path(self, flight_path_file_name):
+        flight_path = []
+        if flight_path_file_name in self._flight_path_positions.keys():
+            with open(flight_path_file_name, 'r', encoding='UTF8') as csvfile:
+                reader = csv.reader(csvfile)
+                for i, row in enumerate(reader):
+                    if i >= 1:
+                        flight_path.append(list([float(x) for x in row]))
+        self._flight_path_positions[flight_path_file_name] = flight_path
+        self._plot_3d.update_flight_pos(self._flight_path_positions[flight_path_file_name])
+
+        
+    def _land_button_clicked(self):
+        print("land")
+        self._hlCommander.land()
+
+
+
+    def _play_flight_path_button_clicked(self):
+        print("play")
+        
+        flightPathWorker = RunFlightPathWorker(self._hlCommander, self)
+        self.threadpool.start(flightPathWorker)
+
+            
+    
+    def distance(self, pos, x, y, z):
+        return math.sqrt((pos[0]-x)**2+(pos[1]-y)**2+(pos[2]-z)**2)
+
     def _load_sys_config_button_clicked(self):
         names = QFileDialog.getOpenFileName(self, 'Open file', self._helper.current_folder, "*.yaml;;*.*")
 
@@ -704,3 +819,132 @@ class LighthouseTab(Tab, lighthouse_tab_class):
             filename = names[0]
 
         LighthouseConfigFileManager.write(filename, geos=geos, calibs=calibs, system_type=system_type)
+
+class RunFlightPathWorker(QRunnable):
+    def __init__(self, _hlCommander, _tab):
+        super(RunFlightPathWorker, self).__init__()
+        
+        self._hlCommander = _hlCommander
+        self._tab = _tab
+
+
+    @pyqtSlot()
+    def run(self):
+        DEL = 0.02
+        if self._tab._hlCommander is None:
+            return
+        
+        self._tab._helper.cf.param.set_value('kalman.resetEstimation', '1')
+        time.sleep(1)
+        for name in self._tab._flight_path_positions:
+            print("replaying ", name)
+            if self._tab._flight_path_positions[name] is not Empty:
+                self._hlCommander.go_to(
+                    x=self._tab._flight_path_positions[name][0][0],
+                    y=self._tab._flight_path_positions[name][0][1],
+                    z=self._tab._flight_path_positions[name][0][2]
+                )
+            distance = self._tab.distance(
+                    list(self._tab._helper.pose_logger.position),
+                    self._tab._flight_path_positions[name][0][0],
+                    self._tab._flight_path_positions[name][0][1],
+                    self._tab._flight_path_positions[name][0][2]
+                )
+            while distance > 0.03:
+                #have not reached first point
+                self._tab._plot_3d.update_cf_pose(self._tab._helper.pose_logger.position,
+                                            self._tab._rpy_to_rot(self._tab._helper.pose_logger.rpy_rad))
+                distance = self._tab.distance(
+                    list(self._tab._helper.pose_logger.position),
+                    self._tab._flight_path_positions[name][0][0],
+                    self._tab._flight_path_positions[name][0][1],
+                    self._tab._flight_path_positions[name][0][2]
+                )
+            #when replaying flight path, only send the drone a vertex if it is > some distance away
+            print("playing points")
+            for point in self._tab._flight_path_positions[name]:
+                self._tab._update_graphics()
+                distance = self._tab.distance(
+                    list(self._tab._helper.pose_logger.position),
+                    point[0],
+                    point[1],
+                    point[2]
+                )
+                if distance > 0.3:
+                    print("Sent vertex", point[0], point[1], point[2])
+
+                    self._hlCommander.go_to(
+                        x=point[0],
+                        y=point[1],
+                        z=point[2]
+                        )
+
+            print("Done")
+            self._hlCommander.go_to(
+                    x=0,
+                    y=0,
+                    z=0
+                )
+
+
+            self._tab._hlCommander.land()
+
+
+        # DEL = 0.02
+        # if self._hlCommander is None:
+        #     return
+        
+        # self._helper.cf.param.set_value('kalman.resetEstimation', '1')
+        # time.sleep(1)
+        # for name in self._flight_path_positions:
+        #     print("replaying ", name)
+        #     if self._flight_path_positions[name] is not Empty:
+        #         self._hlCommander.go_to(
+        #             x=self._flight_path_positions[name][0][0],
+        #             y=self._flight_path_positions[name][0][1],
+        #             z=self._flight_path_positions[name][0][2]
+        #         )
+        #     distance = self.distance(
+        #             list(self._helper.pose_logger.position),
+        #             self._flight_path_positions[name][0][0],
+        #             self._flight_path_positions[name][0][1],
+        #             self._flight_path_positions[name][0][2]
+        #         )
+        #     while distance > 0.03:
+        #         #have not reached first point
+        #         self._plot_3d.update_cf_pose(self._helper.pose_logger.position,
+        #                                     self._rpy_to_rot(self._helper.pose_logger.rpy_rad))
+        #         distance = self.distance(
+        #             list(self._helper.pose_logger.position),
+            #         self._flight_path_positions[name][0][0],
+            #         self._flight_path_positions[name][0][1],
+            #         self._flight_path_positions[name][0][2]
+            #     )
+            # #when replaying flight path, only send the drone a vertex if it is > some distance away
+            # print("playing points")
+            # for point in self._flight_path_positions[name]:
+            #     self._update_graphics()
+            #     distance = self.distance(
+            #         list(self._helper.pose_logger.position),
+            #         point[0],
+            #         point[1],
+            #         point[2]
+            #     )
+            #     if distance > 0.3:
+            #         print("Sent vertex", point[0], point[1], point[2])
+
+            #         self._hlCommander.go_to(
+            #             x=point[0],
+            #             y=point[1],
+            #             z=point[2]
+            #             )
+
+            # print("Done")
+            # self._hlCommander.go_to(
+            #         x=0,
+            #         y=0,
+            #         z=0
+            #     )
+
+
+            # self._hlCommander.land()
